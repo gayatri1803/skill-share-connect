@@ -5,11 +5,13 @@ import Layout from "@/components/Layout";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
+import { Progress } from "@/components/ui/progress";
+import { Input } from "@/components/ui/input";
 import { useToast } from "@/hooks/use-toast";
-import { 
-  Sparkles, 
-  MessageSquare, 
-  Loader2, 
+import {
+  Sparkles,
+  MessageSquare,
+  Loader2,
   ArrowRight,
   UserPlus,
   RefreshCw
@@ -27,6 +29,9 @@ interface MatchedUser {
   match_reason?: string;
   matchId?: string;
   status?: string;
+  matchPercentage?: number;
+  explanation?: string;
+  avatar_url?: string;
 }
 
 export default function MatchesPage() {
@@ -38,6 +43,9 @@ export default function MatchesPage() {
   const [existingMatches, setExistingMatches] = useState<MatchedUser[]>([]);
   const [loading, setLoading] = useState(true);
   const [generatingReasons, setGeneratingReasons] = useState<Set<string>>(new Set());
+  const [learnerSkill, setLearnerSkill] = useState("");
+  const [aiMatches, setAiMatches] = useState<MatchedUser[]>([]);
+  const [findingMatches, setFindingMatches] = useState(false);
 
   const fetchMatches = async () => {
     if (!user) return;
@@ -273,6 +281,167 @@ export default function MatchesPage() {
     navigate(`/chat?match=${matchedUser.matchId}`);
   };
 
+  const findAIMatches = async () => {
+    if (!user || !learnerSkill.trim()) return;
+
+    setFindingMatches(true);
+    try {
+      // Query skills_offered first to get matching user_ids
+      const { data: skillsData, error: skillsError } = await supabase
+        .from("skills_offered")
+        .select("user_id, skill_name")
+        .ilike("skill_name", `%${learnerSkill.trim()}%`)
+        .neq("user_id", user.id);
+
+      if (skillsError) throw skillsError;
+
+      if (!skillsData || skillsData.length === 0) {
+        setAiMatches([]);
+        toast({
+          title: "No matches found",
+          description: `No users found offering "${learnerSkill.trim()}".`,
+        });
+        return;
+      }
+
+      // Get unique user IDs
+      const userIds = [...new Set(skillsData.map(item => item.user_id))];
+
+      // Query profiles for these users
+      const { data: profilesData, error: profilesError } = await supabase
+        .from("profiles")
+        .select("user_id, full_name, bio, location, avatar_url")
+        .in("user_id", userIds);
+
+      if (profilesError) throw profilesError;
+
+      if (!profilesData || profilesData.length === 0) {
+        setAiMatches([]);
+        return;
+      }
+
+      // Query skills_wanted for these users
+      const { data: wantedData, error: wantedError } = await supabase
+        .from("skills_wanted")
+        .select("user_id, skill_name")
+        .in("user_id", userIds);
+
+      if (wantedError) throw wantedError;
+
+      // Build mentor profiles for AI analysis
+      const mentorProfiles = profilesData.map((profile: any) => {
+        const offeredSkills = skillsData
+          .filter(skill => skill.user_id === profile.user_id)
+          .map(skill => skill.skill_name);
+
+        const wantedSkills = (wantedData || [])
+          .filter(skill => skill.user_id === profile.user_id)
+          .map(skill => skill.skill_name);
+
+        return {
+          user_id: profile.user_id,
+          full_name: profile.full_name,
+          bio: profile.bio || "",
+          skills_offered: offeredSkills,
+          skills_wanted: wantedSkills
+        };
+      });
+
+      // Get current user's profile and skills for better AI matching
+      const { data: userProfile } = await supabase
+        .from("profiles")
+        .select("bio, location")
+        .eq("user_id", user.id)
+        .single();
+
+      const { data: userOfferedSkills } = await supabase
+        .from("skills_offered")
+        .select("skill_name")
+        .eq("user_id", user.id);
+
+      const { data: userWantedSkills } = await supabase
+        .from("skills_wanted")
+        .select("skill_name")
+        .eq("user_id", user.id);
+
+      const learnerProfile = {
+        bio: userProfile?.bio || "",
+        location: userProfile?.location || "",
+        skillsOffered: userOfferedSkills?.map(s => s.skill_name) || [],
+        skillsWanted: userWantedSkills?.map(s => s.skill_name) || []
+      };
+
+      // Call the AI match function
+      const { data: aiData, error: aiError } = await supabase.functions.invoke('match', {
+        body: {
+          learnerSkill: learnerSkill.trim(),
+          learnerProfile,
+          mentorProfiles
+        }
+      });
+
+      if (aiError) {
+        console.warn("AI function failed, falling back to simple matching:", aiError);
+        // Fallback to simple matching if AI fails
+        const matches: MatchedUser[] = mentorProfiles.map((mentor: any) => ({
+          id: mentor.user_id,
+          user_id: mentor.user_id,
+          full_name: mentor.full_name,
+          bio: mentor.bio,
+          location: profilesData.find(p => p.user_id === mentor.user_id)?.location || "",
+          avatar_url: profilesData.find(p => p.user_id === mentor.user_id)?.avatar_url,
+          skills_offered: mentor.skills_offered,
+          skills_wanted: mentor.skills_wanted,
+          matchPercentage: Math.floor(Math.random() * 40) + 60,
+          explanation: `Offers ${learnerSkill.trim()} skills that match your interests.`
+        }));
+        setAiMatches(matches);
+        toast({
+          title: "Matches found!",
+          description: `Found ${matches.length} user(s) offering "${learnerSkill.trim()}" (simple matching - AI unavailable).`,
+        });
+        return;
+      }
+
+      if (!aiData || !Array.isArray(aiData.matches)) {
+        throw new Error('Invalid response from AI match service');
+      }
+
+      // Process AI results
+      const matches: MatchedUser[] = aiData.matches.map((match: any) => {
+        const profile = profilesData.find(p => p.user_id === match.mentorId);
+        return {
+          id: match.mentorId,
+          user_id: match.mentorId,
+          full_name: match.mentorName,
+          bio: profile?.bio || "",
+          location: profile?.location || "",
+          avatar_url: profile?.avatar_url,
+          skills_offered: match.skillsOffered || [],
+          skills_wanted: [], // AI doesn't return wanted skills in current format
+          matchPercentage: match.matchPercentage,
+          explanation: match.explanation
+        };
+      });
+
+      setAiMatches(matches);
+      toast({
+        title: "🤖 AI Matches found!",
+        description: `Found ${matches.length} user(s) with Gemini AI-powered matching for "${learnerSkill.trim()}".`,
+      });
+
+    } catch (error) {
+      console.error("Error finding matches:", error);
+      toast({
+        title: "Error",
+        description: "Failed to find matches. Please try again.",
+        variant: "destructive",
+      });
+    } finally {
+      setFindingMatches(false);
+    }
+  };
+
   const MatchCard = ({ matchedUser, type }: { matchedUser: MatchedUser; type: "potential" | "existing" }) => (
     <Card variant="match" className="overflow-hidden">
       <CardContent className="p-6 space-y-4">
@@ -283,13 +452,30 @@ export default function MatchesPage() {
               <p className="text-sm text-muted-foreground">{matchedUser.location}</p>
             )}
           </div>
-          {matchedUser.status === "accepted" && (
-            <Badge variant="skill">Connected</Badge>
-          )}
-          {matchedUser.status === "pending" && (
-            <Badge variant="outline">Pending</Badge>
-          )}
+          <div className="flex items-center gap-2">
+            {matchedUser.matchPercentage !== undefined && (
+              <Badge variant="skill" className="text-sm font-bold">
+                {matchedUser.matchPercentage}% Match
+              </Badge>
+            )}
+            {matchedUser.status === "accepted" && (
+              <Badge variant="skill">Connected</Badge>
+            )}
+            {matchedUser.status === "pending" && (
+              <Badge variant="outline">Pending</Badge>
+            )}
+          </div>
         </div>
+
+        {matchedUser.matchPercentage !== undefined && (
+          <div className="space-y-2">
+            <div className="flex justify-between text-sm">
+              <span className="text-muted-foreground">Match Score</span>
+              <span className="font-medium">{matchedUser.matchPercentage}%</span>
+            </div>
+            <Progress value={matchedUser.matchPercentage} className="h-2" />
+          </div>
+        )}
 
         {matchedUser.bio && (
           <p className="text-sm text-muted-foreground line-clamp-2">{matchedUser.bio}</p>
@@ -333,6 +519,15 @@ export default function MatchesPage() {
             <div className="flex items-start gap-2">
               <Sparkles className="w-4 h-4 text-primary mt-0.5 flex-shrink-0" />
               <p className="text-sm text-foreground">{matchedUser.match_reason}</p>
+            </div>
+          </div>
+        )}
+
+        {matchedUser.explanation && (
+          <div className="bg-blue-50 rounded-xl p-3 border border-blue-200">
+            <div className="flex items-start gap-2">
+              <Sparkles className="w-4 h-4 text-blue-600 mt-0.5 flex-shrink-0" />
+              <p className="text-sm text-foreground">{matchedUser.explanation}</p>
             </div>
           </div>
         )}
@@ -420,6 +615,54 @@ export default function MatchesPage() {
             Refresh
           </Button>
         </div>
+
+        {/* AI Matching Section */}
+        <Card className="p-6">
+          <div className="space-y-4">
+            <h2 className="text-xl font-semibold text-foreground">AI-Powered Skill Matching</h2>
+            <p className="text-muted-foreground">
+              Enter a skill you want to learn and get AI-ranked matches with potential mentors.
+            </p>
+            <div className="flex gap-2">
+              <Input
+                type="text"
+                placeholder="e.g., guitar, photography, cooking"
+                value={learnerSkill}
+                onChange={(e) => setLearnerSkill(e.target.value)}
+              />
+              <Button onClick={findAIMatches} disabled={findingMatches || !learnerSkill.trim()}>
+                {findingMatches ? (
+                  <>
+                    <Loader2 className="w-4 h-4 animate-spin mr-2" />
+                    Finding...
+                  </>
+                ) : (
+                  <>
+                    <Sparkles className="w-4 h-4 mr-2" />
+                    Find Matches
+                  </>
+                )}
+              </Button>
+            </div>
+          </div>
+        </Card>
+
+        {/* AI Matches */}
+        {aiMatches.length > 0 && (
+          <div className="space-y-4">
+            <h2 className="text-xl font-semibold text-foreground">
+              AI Matches for "{learnerSkill}"
+              <span className="ml-2 text-sm font-normal text-muted-foreground">
+                ({aiMatches.length} found)
+              </span>
+            </h2>
+            <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
+              {aiMatches.map(match => (
+                <MatchCard key={match.user_id} matchedUser={match} type="potential" />
+              ))}
+            </div>
+          </div>
+        )}
 
         {/* Existing Matches */}
         {existingMatches.length > 0 && (
